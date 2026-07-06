@@ -6,8 +6,8 @@
 | 任务用途 | 实例阴影检测: 目标实例、阴影实例与目标-阴影关联预测 |
 | 仓库 | SSISv2 |
 | 版本 / commit | 4d840f3 / finish |
-| 日期 | 2026-06-17 |
-| 硬件 | Ascend 950PR x8 / CANN 9.0 / npu-smi 25.7.rc1 |
+| 日期 | 2026-07-06 |
+| 硬件 | Ascend 950PR / 单卡 NPU 指标口径 / CANN 9.0 / npu-smi 25.7.rc1 |
 | 软件 | Python 3.11.6 / torch 2.10.0+cpu / torch_npu 2.10.0 / torchvision 0.25.0+cpu / detectron2 0.6 / numpy 1.26.4 |
 
 ---
@@ -86,6 +86,14 @@ python SOAP.py \
 ```
 
 ## 3. 验证用例
+**输入规格**
+
+- 任务输入为 BGR 图片, Detectron2 数据流保持长宽比 resize。
+- 训练输入: `INPUT.MIN_SIZE_TRAIN=(640, 672, 704, 736, 768, 800)`, `INPUT.MAX_SIZE_TRAIN=1333`, 每张图随机选择短边尺寸, 长边不超过 1333。
+- 推理输入: `INPUT.MIN_SIZE_TEST=800`, `INPUT.MAX_SIZE_TEST=1333`, 短边 resize 到 800, 长边不超过 1333。
+- batch: 训练 `IMS_PER_BATCH=2`; 推理 batch=1。
+- 数据集图像数量: SOBA-train 840 images, SOBA-testing 160 images, SOBA-challenge 100 images。完整原图分辨率分布没有保存在当前可核查证据中; 已保存证据只包含一个标注修正个例: `challenge-shadow079.jpg` 实际尺寸为 799x574, 原标注为 776x574。
+
 **训练集与训练闭环**
 
 - SOBA-train: 840 images, 5998 annotations, 3000 association items。
@@ -148,6 +156,13 @@ python SOAP.py \
 | 推理 HBM 占用 | challenge 评测峰值 22357MB / 114688MB |
 | 关键算子是否回退 CPU | NMS 回 CPU; SOBA/SOAP 评估在 CPU; ModulatedDeformConv 用普通 NPU conv2d 兼容实现 |
 | 性能 | 训练 0.5621s/iter; challenge 2.00 img/s; testing 5.65 img/s |
+
+**CPU 口径**
+
+- CPU 参与范围: dataloader/augmentation、CPU `batched_nms`、SOBA/SOAP evaluator、numpy/pycocotools 后处理。
+- 任务配置的 CPU 并发: 训练和推理命令均设置 `DATALOADER.NUM_WORKERS=0`, 因此没有额外 dataloader worker 进程; 单卡训练/推理为单主 Python 进程。CPU NMS 与 evaluator 也在主流程中执行。
+- 实际 CPU 核心占用: 现有会话证据没有采集 `pidstat`、`top -H`、`OMP_NUM_THREADS`、`MKL_NUM_THREADS` 或进程亲和性, 因此不能确认任务运行时实际占用了多少 CPU 核。不能用机器总核数替代任务使用核数。
+- x86 AVX: 训练/评测日志中的 PyTorch build info 显示 CPU capability usage 为 AVX512, 且 build settings 启用 `PERF_WITH_AVX=1`、`PERF_WITH_AVX2=1`; 这只能说明当前 PyTorch CPU kernel 具备 AVX/AVX2/AVX512 优化路径, 不等价于确认本任务 CPU fallback 每个热点都实际命中了 AVX512 kernel。
 
 **计算分布**
 
