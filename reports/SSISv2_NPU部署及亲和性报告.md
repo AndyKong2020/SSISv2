@@ -92,7 +92,10 @@ python SOAP.py \
 - 训练输入: `INPUT.MIN_SIZE_TRAIN=(640, 672, 704, 736, 768, 800)`, `INPUT.MAX_SIZE_TRAIN=1333`, 每张图随机选择短边尺寸, 长边不超过 1333。
 - 推理输入: `INPUT.MIN_SIZE_TEST=800`, `INPUT.MAX_SIZE_TEST=1333`, 短边 resize 到 800, 长边不超过 1333。
 - batch: 训练 `IMS_PER_BATCH=2`; 推理 batch=1。
-- 数据集图像数量: SOBA-train 840 images, SOBA-testing 160 images, SOBA-challenge 100 images。完整原图分辨率分布没有保存在当前可核查证据中; 已保存证据只包含一个标注修正个例: `challenge-shadow079.jpg` 实际尺寸为 799x574, 原标注为 776x574。
+- 数据集原图规格来自实际图像解码与标注 JSON 交叉校验。SOBA-train 840 images / 5998 annotations, 原图分辨率 220x154 到 2304x2168, 面积 38,720 到 3,592,376 像素, 共 412 种分辨率; 高频分辨率为 1024x683(90)、640x480(72)、1024x768(35)、1024x572(31)、645x484(26)、1024x682(25)、1024x576(24)、640x426(15)。
+- SOBA-testing 160 images / 1248 annotations, 原图分辨率 297x236 到 2304x1728, 面积 105,732 到 3,981,312 像素, 共 113 种分辨率; 高频分辨率为 1024x683(16)、1024x768(14)、640x480(7)、1280x853(4)、2048x1536(3)、1024x682(2)、768x1024(2)、1024x576(2)。
+- SOBA-challenge 100 images / 1340 annotations, 原图分辨率 533x373 到 3888x3888, 面积 271,360 到 10,077,696 像素, 共 78 种分辨率; 高频分辨率为 800x600(9)、2048x1536(5)、799x533(4)、640x480(3)、800x530(2)、533x799(2)、1024x768(2)、1600x1200(2)。
+- 三个 split 的标注宽高与实际图像解码尺寸均已一致, missing/error/mismatch 均为 0。Challenge 集 `challenge-shadow079.jpg` 曾存在宽度标注不一致, 以实际图像解码尺寸修正后纳入上述统计。
 
 **训练集与训练闭环**
 
@@ -147,6 +150,8 @@ python SOAP.py \
 ## 4. NPU 亲和性
 口径: Ascend 950PR, 架构版本 3510, FP32 eager, 单卡训练 batch=2, 单卡推理 batch=1, 输入短边 800/max 1333。AMP 关闭, 不把 FP16 平衡点直接当作 FP32 评分。该模型是检测/实例分割动态图执行流, 真实瓶颈由卷积主干、动态 mask 分支、NMS、Python evaluator 和训练数据管线共同决定。
 
+NPU 指标统一按单卡任务统计。`ASCEND_RT_VISIBLE_DEVICES=7` 运行验证中, torch_npu 可见设备数为 1, 训练进程在物理卡 7 上分配 HBM, Python 内部设备名为 `npu:0`; 因此训练/推理利用率、HBM 和吞吐均不按多卡汇总。表中 HBM 分母沿用对应运行采样记录的 114688MB; 同型号卡在该环境中 `npu-smi` 显示单卡 HBM 为 131072MB, 不改变已记录任务峰值。
+
 | 指标 | 数值 |
 |---|---|
 | 能否在 NPU 跑通 | 单卡训练与单卡推理可跑通; 2 进程 DDP 需要 launcher/backend 适配 |
@@ -160,9 +165,9 @@ python SOAP.py \
 **CPU 口径**
 
 - CPU 参与范围: dataloader/augmentation、CPU `batched_nms`、SOBA/SOAP evaluator、numpy/pycocotools 后处理。
-- 任务配置的 CPU 并发: 训练和推理命令均设置 `DATALOADER.NUM_WORKERS=0`, 因此没有额外 dataloader worker 进程; 单卡训练/推理为单主 Python 进程。CPU NMS 与 evaluator 也在主流程中执行。
-- 实际 CPU 核心占用: 现有会话证据没有采集 `pidstat`、`top -H`、`OMP_NUM_THREADS`、`MKL_NUM_THREADS` 或进程亲和性, 因此不能确认任务运行时实际占用了多少 CPU 核。不能用机器总核数替代任务使用核数。
-- x86 AVX: 训练/评测日志中的 PyTorch build info 显示 CPU capability usage 为 AVX512, 且 build settings 启用 `PERF_WITH_AVX=1`、`PERF_WITH_AVX2=1`; 这只能说明当前 PyTorch CPU kernel 具备 AVX/AVX2/AVX512 优化路径, 不等价于确认本任务 CPU fallback 每个热点都实际命中了 AVX512 kernel。
+- 任务配置的 CPU 并发: 训练和推理命令均设置 `DATALOADER.NUM_WORKERS=0`, 因此没有额外 dataloader worker 进程; 单卡训练/推理为单主 Python 进程。CPU NMS 与 evaluator 也在主流程中执行。PyTorch/MKL/OpenMP 线程池仍会在主进程下创建工作线程, 不能把 dataloader worker 数等同于 CPU 实际用核数。
+- 实际 CPU 核心占用: 对单卡 20 iter 训练进程按 0.2s 间隔采样 `/proc/<pid>/task/*/stat`, 统计有 CPU tick 增量的线程及其调度 CPU。该训练段 `DATALOADER.NUM_WORKERS=0`, `IMS_PER_BATCH=2`, 17 个计时 iteration 平均 0.4987s/iter; 采样到 260 个线程, 全程迁移覆盖 196 个 CPU core, 单个采样窗口最多同时有 132 个活跃线程、130 个活跃 CPU core。CPU 任务用核以“最大同时活跃 CPU core=130”描述, 全程 196 个 core 是调度迁移覆盖范围, 不是同时用核。
+- x86 AVX: CPU 架构为 x86_64, 处理器为 AMD EPYC 9575F。`lscpu` flags 包含 AVX、AVX2、AVX512F、AVX512DQ、AVX512BW、AVX512VL、AVX512_BF16、AVX512_VNNI、AVX_VNNI、FMA 等; PyTorch build info 显示 `CPU capability usage: AVX512`, 并启用 MKL、MKL-DNN、OpenMP、`PERF_WITH_AVX=1`、`PERF_WITH_AVX2=1`。这说明 CPU fallback 与后处理可使用 AVX/AVX2/AVX512 优化路径, 但具体到 NMS、evaluator、numpy/pycocotools 每个热点的指令级命中需要 perf/VTune 类工具另行确认。
 
 **计算分布**
 
